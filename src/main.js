@@ -31,6 +31,7 @@ let clock = new THREE.Clock();
 
 // ============ PLAY.FUN SDK ============
 let sdk = null;
+let sdkReady = false;
 let sessionPoints = 0;
 
 function initPlayFun() {
@@ -40,21 +41,31 @@ function initPlayFun() {
       ui: { usePointsWidget: true, theme: 'light' },
       logLevel: 1
     });
-    sdk.on('OnReady', () => console.log('[PlayFun] Ready'));
+    sdk.on('OnReady', () => {
+      console.log('[PlayFun] Ready');
+      sdkReady = true;
+    });
     sdk.init();
   }
 }
 
 function addPoints(amount) {
+  if (amount <= 0) return;
   sessionPoints += amount;
-  if (sdk) {
-    try { sdk.addPoints(amount); } catch(e) {}
+  if (sdk && sdkReady) {
+    try { sdk.addPoints(amount); } catch(e) { console.error('[PlayFun] addPoints error:', e); }
   }
 }
 
+function deductPoints(amount) {
+  sessionPoints = Math.max(0, sessionPoints - amount);
+  // Note: SDK doesn't have deductPoints, but we track locally
+}
+
 function savePoints() {
-  if (sdk) {
-    try { sdk.savePoints(); } catch(e) {}
+  console.log('[PlayFun] Saving points, sdkReady:', sdkReady, 'sessionPoints:', sessionPoints);
+  if (sdk && sdkReady) {
+    try { sdk.savePoints(); } catch(e) { console.error('[PlayFun] savePoints error:', e); }
   }
 }
 
@@ -259,9 +270,12 @@ function createOpponents() {
     
     state.opponents.push({
       mesh: opponent,
-      speed: 1.5 + Math.random() * 0.5,
+      baseSpeed: 2.2 + Math.random() * 0.6, // Faster base speed (2.2-2.8)
+      speed: 2.2 + Math.random() * 0.6,
       lane: lane,
-      z: opponent.position.z
+      z: opponent.position.z,
+      boostTimer: 0,
+      boosting: false
     });
   }
 }
@@ -503,17 +517,30 @@ function restartGame() {
   startGame();
 }
 
-function endGame(won) {
+function endGame(won, placement = 4) {
   state.gameOver = true;
   state.isPlaying = false;
   state.won = won;
   
   const title = document.getElementById('game-over-title');
-  title.textContent = won ? '🎉 YOU WON! 🎉' : '💀 GAME OVER 💀';
+  if (won && placement === 1) {
+    title.textContent = '🥇 1ST PLACE! 🥇';
+  } else if (won && placement === 2) {
+    title.textContent = '🥈 2ND PLACE 🥈';
+  } else if (won && placement === 3) {
+    title.textContent = '🥉 3RD PLACE 🥉';
+  } else if (won) {
+    title.textContent = '😅 4TH PLACE 😅';
+  } else {
+    // Didn't finish - opponents won
+    state.score = Math.max(0, state.score - 200); // Penalty for not finishing
+    title.textContent = '💀 TOO SLOW! 💀';
+  }
   
   document.getElementById('final-score').textContent = `Score: ${state.score}`;
   document.getElementById('game-over-screen').style.display = 'flex';
   
+  // Always save points at end
   savePoints();
 }
 
@@ -546,9 +573,28 @@ function update(delta) {
   camera.position.z = state.playerZ - 8;
   camera.lookAt(player.position.x, 1, state.playerZ + 10);
   
-  // Update opponents
+  // Update opponents (more competitive!)
   state.opponents.forEach(opp => {
-    opp.z += opp.speed * delta;
+    // Random boost bursts
+    if (!opp.boosting && Math.random() < 0.01) {
+      opp.boosting = true;
+      opp.boostTimer = 0.5 + Math.random() * 0.5;
+    }
+    
+    if (opp.boosting) {
+      opp.boostTimer -= delta;
+      opp.speed = opp.baseSpeed * 1.8; // Boost speed
+      if (opp.boostTimer <= 0) {
+        opp.boosting = false;
+        opp.speed = opp.baseSpeed;
+      }
+    }
+    
+    // Speed up as race progresses (rubber banding)
+    const progressBonus = Math.min(opp.z / FINISH_LINE_POS, 1) * 0.5;
+    const effectiveSpeed = opp.speed + progressBonus;
+    
+    opp.z += effectiveSpeed * delta;
     opp.mesh.position.z = opp.z;
     
     // Check if opponent won
@@ -564,9 +610,15 @@ function update(delta) {
     const laneDist = Math.abs(obs.lane - playerLaneX);
     
     if (dist < 1 && laneDist < 1.5) {
-      // Hit obstacle - slow down!
+      // Hit obstacle - slow down AND lose points!
       state.playerZ -= 2;
       player.position.z = state.playerZ;
+      
+      // Point penalty based on obstacle type
+      const penalty = obs.type === 'cat' ? 50 : obs.type === 'puddle' ? 30 : 20;
+      state.score = Math.max(0, state.score - penalty);
+      deductPoints(penalty);
+      
       obs.z = -100; // Move obstacle away
       obs.mesh.position.z = -100;
     }
@@ -575,13 +627,28 @@ function update(delta) {
   // Check win condition
   if (state.playerZ >= FINISH_LINE_POS) {
     state.won = true;
-    state.score = Math.floor(1000 - state.playerZ * 5) + 500; // Bonus for winning
+    
+    // Calculate placement (how many opponents finished before us)
+    const opponentsAhead = state.opponents.filter(o => o.z >= FINISH_LINE_POS).length;
+    const placement = opponentsAhead + 1; // 1st, 2nd, 3rd, or 4th
+    
+    // Placement bonuses/penalties
+    const placementBonus = placement === 1 ? 500 : placement === 2 ? 200 : placement === 3 ? 50 : -100;
+    state.score += placementBonus;
+    state.score = Math.max(0, state.score);
+    
     addPoints(state.score);
-    endGame(true);
+    endGame(true, placement);
+    return;
   }
   
-  // Update score based on distance
-  state.score = Math.floor(state.playerZ * 10);
+  // Update score based on distance (accumulate during gameplay)
+  const newScore = Math.floor(state.playerZ * 10);
+  if (newScore > state.score) {
+    const diff = newScore - state.score;
+    state.score = newScore;
+    addPoints(diff); // Add points as we progress
+  }
   state.distance = Math.floor(FINISH_LINE_POS - state.playerZ);
   
   // Update UI
