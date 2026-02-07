@@ -36,6 +36,7 @@ let sessionPoints = 0;
 function initPlayFun() {
   if (typeof OpenGameSDK !== 'undefined') {
     sdk = new OpenGameSDK({
+      gameId: '4cd3aa62-066d-42e4-b5fa-6573496cf9e4',
       ui: { usePointsWidget: true, theme: 'light' },
       logLevel: 1
     });
